@@ -476,3 +476,50 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def append_pose(self, pose_tensor: torch.Tensor):
+        if not isinstance(pose_tensor, torch.Tensor):
+            raise TypeError('pose_tensor must be a torch.Tensor')
+        if pose_tensor.ndim == 1:
+            pose_tensor = pose_tensor.unsqueeze(0)
+        pose_tensor = pose_tensor.to(self.P.device)
+        stored_state = None
+        if self.optimizer:
+            stored_state = self.optimizer.state.get(self.P, None)
+            if stored_state is not None:
+                for key, value in list(stored_state.items()):
+                    if torch.is_tensor(value):
+                        zeros = torch.zeros((pose_tensor.shape[0],) + value.shape[1:], dtype=value.dtype, device=value.device)
+                        stored_state[key] = torch.cat((value, zeros), dim=0)
+        new_param = nn.Parameter(torch.cat((self.P.detach(), pose_tensor), dim=0).requires_grad_(True))
+        if self.optimizer:
+            if stored_state is not None:
+                del self.optimizer.state[self.P]
+            for group in self.optimizer.param_groups:
+                if group.get('name') == 'pose':
+                    group['params'][0] = new_param
+                    if stored_state is not None:
+                        self.optimizer.state[new_param] = stored_state
+                    break
+        self.P = new_param
+
+    def save_ply_subset(self, path, mask):
+        if isinstance(mask, torch.Tensor):
+            mask_np = mask.detach().cpu().numpy().astype(bool)
+        else:
+            mask_np = np.asarray(mask, dtype=bool)
+        mkdir_p(os.path.dirname(path))
+        xyz = self._xyz.detach().cpu().numpy()[mask_np]
+        normals = np.zeros_like(xyz)
+        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()[mask_np]
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()[mask_np]
+        opacities = self._opacity.detach().cpu().numpy()[mask_np]
+        scale = self._scaling.detach().cpu().numpy()[mask_np]
+        rotation = self._rotation.detach().cpu().numpy()[mask_np]
+
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)

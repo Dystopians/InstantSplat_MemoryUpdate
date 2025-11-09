@@ -17,7 +17,7 @@ from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, loadCam
 from utils.graphics_utils import compute_scale_gaussian_by_project_pair_pcd, fov2focal
 
 class Scene:
@@ -29,6 +29,7 @@ class Scene:
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
+        self.args = args
         self.loaded_iter = None
         self.gaussians = gaussians
 
@@ -68,6 +69,9 @@ class Scene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
+        self.train_camera_infos = list(scene_info.train_cameras)
+        self.test_camera_infos = list(scene_info.test_cameras)
+
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
         for resolution_scale in resolution_scales:
@@ -104,3 +108,17 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def append_train_camera(self, cam_info, resolution_scales=None):
+        if resolution_scales is None:
+            resolution_scales = list(self.train_cameras.keys())
+        self.train_camera_infos.append(cam_info)
+        appended = {}
+        for scale in resolution_scales:
+            camera_list = self.train_cameras[scale]
+            idx = len(camera_list)
+            cam = loadCam(self.args, idx, cam_info, scale)
+            cam.uid = idx
+            camera_list.append(cam)
+            appended[scale] = cam
+        return appended

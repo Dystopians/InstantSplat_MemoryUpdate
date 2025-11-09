@@ -11,12 +11,17 @@
 
 import os
 import sys
+import json
+import random
+import uuid
+from pathlib import Path
 from random import randint
 from time import time
 
 import numpy as np
 import torch
 import torchvision
+from PIL import Image
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
 
@@ -24,9 +29,10 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from gaussian_renderer import render, network_gui
 from scene import Scene, GaussianModel
 from scene.cameras import Camera
+from scene.dataset_readers import CameraInfo
 from utils.camera_utils import generate_interpolated_path
 from utils.general_utils import safe_state
-from utils.graphics_utils import getWorld2View2_torch
+from utils.graphics_utils import getWorld2View2_torch, focal2fov
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
 from utils.pose_utils import get_camera_from_tensor
@@ -83,6 +89,195 @@ def load_and_prepare_confidence(confidence_path, device='cuda', scale=(0.1, 1.0)
     lr_modifiers = inverted_confidence * (max_scale - min_scale) + min_scale
     
     return lr_modifiers
+
+
+
+def load_matrix_argument(arg, expected_shape, name):
+    if arg is None:
+        return None
+    path = Path(str(arg))
+    if path.exists():
+        if path.suffix in {".npy", ".npz"}:
+            data = np.load(path, allow_pickle=False)
+            if isinstance(data, np.lib.npyio.NpzFile):
+                if not data.files:
+                    raise ValueError(f"{name}: npz file {path} is empty")
+                mat = data[data.files[0]]
+            else:
+                mat = data
+        else:
+            try:
+                with open(path, 'r') as f:
+                    loaded = json.load(f)
+                mat = np.asarray(loaded, dtype=np.float32)
+            except json.JSONDecodeError:
+                with open(path, 'r') as f:
+                    values = [float(x) for x in f.read().replace(';', ',').split(',') if x.strip()]
+                mat = np.asarray(values, dtype=np.float32)
+    else:
+        values = [float(x) for x in str(arg).replace(';', ',').split(',') if x.strip()]
+        mat = np.asarray(values, dtype=np.float32)
+    mat = np.asarray(mat, dtype=np.float32)
+    if mat.size != int(np.prod(expected_shape)):
+        raise ValueError(f"{name}: expected {int(np.prod(expected_shape))} values, got {mat.size}")
+    mat = mat.reshape(expected_shape)
+    return mat
+
+
+
+def build_camera_info_from_inputs(image_path, intrinsics, Tcw, uid):
+    image_path = Path(image_path)
+    image = Image.open(image_path).convert('RGB')
+    width, height = image.size
+    if intrinsics is None or Tcw is None:
+        raise ValueError('intrinsics and Tcw must be provided to build CameraInfo')
+    fx = float(intrinsics[0, 0])
+    fy = float(intrinsics[1, 1])
+    fovx = focal2fov(fx, width)
+    fovy = focal2fov(fy, height)
+    Rcw = np.asarray(Tcw[:3, :3], dtype=np.float32)
+    tcw = np.asarray(Tcw[:3, 3], dtype=np.float32)
+    Rc2w = np.linalg.inv(Rcw).astype(np.float32)
+    cam_info = CameraInfo(
+        uid=int(uid),
+        R=Rc2w,
+        T=tcw,
+        FovY=fovy,
+        FovX=fovx,
+        image=image,
+        image_path=str(image_path),
+        image_name=image_path.stem,
+        width=width,
+        height=height,
+    )
+    return cam_info
+
+
+
+def apply_mask_to_gaussian_grads(gaussians, mask):
+    if mask is None:
+        return
+    if isinstance(mask, torch.Tensor):
+        mask_t = mask.to(gaussians._xyz.device).float()
+    else:
+        mask_t = torch.tensor(mask, device=gaussians._xyz.device, dtype=torch.float32)
+
+    def _mask_param(param):
+        if param.grad is None:
+            return
+        expanded = mask_t
+        while expanded.ndim < param.grad.ndim:
+            expanded = expanded.unsqueeze(-1)
+        param.grad.mul_(expanded)
+
+    _mask_param(gaussians._xyz)
+    _mask_param(gaussians._features_dc)
+    _mask_param(gaussians._features_rest)
+    _mask_param(gaussians._opacity)
+    _mask_param(gaussians._scaling)
+    _mask_param(gaussians._rotation)
+
+
+
+def zero_out_old_camera_grads(gaussians, old_camera_count):
+    if gaussians.P.grad is None:
+        return
+    if old_camera_count <= 0:
+        return
+    gaussians.P.grad[:old_camera_count] = 0
+
+
+
+def compute_diff_mask(gaussians, baseline_state, original_count, eps=1e-5):
+    current_xyz = gaussians._xyz.detach()
+    device = current_xyz.device
+    mask = torch.zeros(current_xyz.shape[0], dtype=torch.bool, device=device)
+    if original_count < current_xyz.shape[0]:
+        mask[original_count:] = True
+    if original_count > 0:
+        base_xyz = baseline_state['xyz'].to(device)
+        xyz_diff = torch.norm(current_xyz[:original_count] - base_xyz, dim=1)
+        base_dc = baseline_state['features_dc'].to(device)
+        base_rest = baseline_state['features_rest'].to(device)
+        base_opacity = baseline_state['opacity'].to(device)
+        base_scaling = baseline_state['scaling'].to(device)
+        base_rotation = baseline_state['rotation'].to(device)
+        dc_diff = torch.norm(gaussians._features_dc.detach()[:original_count] - base_dc, dim=(1, 2))
+        rest_diff = torch.norm(gaussians._features_rest.detach()[:original_count] - base_rest, dim=(1, 2))
+        opacity_diff = torch.norm(gaussians._opacity.detach()[:original_count] - base_opacity, dim=1)
+        scaling_diff = torch.norm(gaussians._scaling.detach()[:original_count] - base_scaling, dim=1)
+        rotation_diff = torch.norm(gaussians._rotation.detach()[:original_count] - base_rotation, dim=1)
+        combined = (xyz_diff > eps) | (dc_diff > eps) | (rest_diff > eps) | (opacity_diff > eps) | (scaling_diff > eps) | (rotation_diff > eps)
+        mask[:original_count] |= combined
+    return mask
+
+
+
+def evaluate_and_save(scene, gaussians, pipe, background, output_dir, cameras, device='cuda'):
+    os.makedirs(output_dir, exist_ok=True)
+    residual_dir = os.path.join(output_dir, 'residuals')
+    os.makedirs(residual_dir, exist_ok=True)
+    metrics = []
+    with torch.no_grad():
+        for cam in cameras:
+            pose = gaussians.get_RT(cam.uid)
+            render_pkg = render(cam, gaussians, pipe, background, camera_pose=pose)
+            pred = torch.clamp(render_pkg['render'], 0.0, 1.0)
+            gt = torch.clamp(cam.original_image.to(device), 0.0, 1.0)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(pred.unsqueeze(0), gt.unsqueeze(0)).item()
+            else:
+                ssim_value = ssim(pred, gt).item()
+            l1_val = l1_loss(pred, gt).item()
+            psnr_val = psnr(pred, gt).item()
+            diff = torch.abs(pred - gt).mean(dim=0, keepdim=True).repeat(3, 1, 1)
+            torchvision.utils.save_image(pred.detach().cpu(), os.path.join(output_dir, f"{cam.image_name}_render.png"))
+            torchvision.utils.save_image(gt.detach().cpu(), os.path.join(output_dir, f"{cam.image_name}_gt.png"))
+            torchvision.utils.save_image(diff.detach().cpu(), os.path.join(residual_dir, f"{cam.image_name}_residual.png"))
+            metrics.append({
+                'image_name': cam.image_name,
+                'psnr': psnr_val,
+                'ssim': ssim_value,
+                'l1': l1_val,
+            })
+    with open(os.path.join(output_dir, 'metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
+    return metrics
+
+
+
+def snapshot_gaussians(gaussians):
+    return {
+        'xyz': gaussians._xyz.detach().clone(),
+        'features_dc': gaussians._features_dc.detach().clone(),
+        'features_rest': gaussians._features_rest.detach().clone(),
+        'opacity': gaussians._opacity.detach().clone(),
+        'scaling': gaussians._scaling.detach().clone(),
+        'rotation': gaussians._rotation.detach().clone(),
+    }
+
+
+
+def estimate_pose_with_mast3r(reference_image_paths, new_image_path, device, ckpt_path, image_size=512, schedule='cosine', lr=0.01, niter=300, focal_avg=False):
+    from mast3r.model import AsymmetricMASt3R
+    from dust3r.image_pairs import make_pairs
+    from dust3r.inference import inference
+    from dust3r.utils.device import to_numpy
+    from dust3r.utils.geometry import inv
+    from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+    from utils.sfm_utils import load_images
+
+    image_files = list(reference_image_paths) + [str(new_image_path)]
+    imgs, _ = load_images(image_files, size=image_size, verbose=False)
+    pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
+    model = AsymmetricMASt3R.from_pretrained(ckpt_path).to(device)
+    model.eval()
+    output = inference(pairs, model, device=device, batch_size=1, verbose=False)
+    scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
+    scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=lr, focal_avg=focal_avg)
+    extrinsics_w2c = inv(to_numpy(scene.get_im_poses()))
+    intrinsics = to_numpy(scene.get_intrinsics())
+    return intrinsics[-1], extrinsics_w2c[-1]
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -231,6 +426,166 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     save_time(scene.model_path, '[2] train_joint', train_time)
 
 
+def incremental_training(dataset, opt, pipe, args):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    prepare_output_and_logger(dataset)
+    gaussians = GaussianModel(dataset.sh_degree)
+
+    confidence_path = os.path.join(dataset.source_path, f"sparse_{dataset.n_views}/0", "confidence_dsp.npy")
+    confidence_lr = None
+    if os.path.exists(confidence_path):
+        confidence_lr = load_and_prepare_confidence(confidence_path, device='cuda', scale=(1, 100))
+
+    scene = Scene(dataset, gaussians, shuffle=False)
+
+    if args.new_image is None:
+        raise ValueError('Incremental training requires --new_image')
+    if not Path(args.new_image).exists():
+        raise FileNotFoundError(f'new image not found: {args.new_image}')
+
+    opt.iterations = args.incremental_iters
+    opt.position_lr_init *= 0.5
+    opt.position_lr_final *= 0.5
+    opt.scaling_lr *= 0.5
+    opt.feature_lr *= 0.5
+    opt.densify_from_iter = max(args.stage1_iters + 1, 1)
+    opt.densify_until_iter = max(args.stage2_iters, opt.densify_from_iter)
+
+    if opt.pp_optimizer and confidence_lr is not None:
+        gaussians.training_setup_pp(opt, confidence_lr)
+    else:
+        gaussians.training_setup(opt)
+
+    if not args.load_ckpt:
+        raise ValueError('Incremental training requires --load_ckpt')
+    checkpoint_data = torch.load(args.load_ckpt)
+    if isinstance(checkpoint_data, tuple):
+        model_params = checkpoint_data[0]
+    else:
+        model_params = checkpoint_data
+    gaussians.restore(model_params, opt)
+
+    baseline_state = snapshot_gaussians(gaussians)
+    original_point_count = gaussians._xyz.shape[0]
+
+    old_camera_count = len(scene.getTrainCameras())
+    max_uid = max((info.uid for info in scene.train_camera_infos), default=old_camera_count - 1)
+
+    intrinsics = load_matrix_argument(args.new_K, (3, 3), '--new_K')
+    Tcw = load_matrix_argument(args.new_Tcw, (4, 4), '--new_Tcw')
+
+    if args.est_pose:
+        if args.mast3r_ckpt is None:
+            raise ValueError('--est_pose requires --mast3r_ckpt')
+        ref_infos = scene.train_camera_infos[:args.est_max_refs] if args.est_max_refs > 0 else scene.train_camera_infos
+        if not ref_infos:
+            raise ValueError('No reference images available for pose estimation')
+        reference_paths = [info.image_path for info in ref_infos]
+        est_K, est_Tcw = estimate_pose_with_mast3r(reference_paths, args.new_image, args.est_device, args.mast3r_ckpt, image_size=args.est_image_size, focal_avg=args.focal_avg)
+        if intrinsics is None:
+            intrinsics = est_K
+        if Tcw is None:
+            Tcw = est_Tcw
+
+    if intrinsics is None or Tcw is None:
+        raise ValueError('Must provide intrinsics and pose for new image via --new_K/--new_Tcw or --est_pose')
+
+    new_uid = max_uid + 1
+    cam_info = build_camera_info_from_inputs(args.new_image, intrinsics, Tcw, new_uid)
+    appended = scene.append_train_camera(cam_info)
+    new_camera = appended[1.0]
+    train_cameras = scene.getTrainCameras()
+
+    new_pose_tensor = get_tensor_from_camera(new_camera.world_view_transform.transpose(0, 1)).cuda()
+    gaussians.append_pose(new_pose_tensor)
+
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
+
+    stage1_iters = min(args.stage1_iters, args.incremental_iters)
+    stage2_iters = min(args.stage2_iters, args.incremental_iters)
+    total_iters = args.incremental_iters
+    stage2_start = stage1_iters + 1
+    stage_visibility_mask = torch.zeros(gaussians._xyz.shape[0], device='cuda')
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(1, total_iters + 1), desc='Incremental training')
+
+    old_cameras = train_cameras[:old_camera_count]
+
+    for iteration in progress_bar:
+        gaussians.update_learning_rate(iteration)
+
+        if iteration <= stage1_iters:
+            viewpoint_cam = new_camera
+        elif iteration <= stage2_iters:
+            if iteration % 2 == 0 or not old_cameras:
+                viewpoint_cam = new_camera
+            else:
+                idx = randint(0, len(old_cameras) - 1)
+                viewpoint_cam = old_cameras[idx]
+        else:
+            idx = randint(0, len(train_cameras) - 1)
+            viewpoint_cam = train_cameras[idx]
+
+        pose = gaussians.get_RT(viewpoint_cam.uid)
+        bg = torch.rand((3), device='cuda') if opt.random_background else background
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, camera_pose=pose)
+        image = render_pkg['render']
+        viewspace_point_tensor = render_pkg['viewspace_points']
+        visibility_filter = render_pkg['visibility_filter']
+        radii = render_pkg['radii']
+        viewspace_point_tensor.retain_grad()
+
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        if FUSED_SSIM_AVAILABLE:
+            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        else:
+            ssim_value = ssim(image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        loss.backward()
+
+        if iteration <= stage1_iters:
+            vis_mask = visibility_filter.float().to(stage_visibility_mask.device)
+            if stage_visibility_mask.shape[0] != vis_mask.shape[0]:
+                stage_visibility_mask = torch.zeros_like(vis_mask)
+            stage_visibility_mask = torch.maximum(stage_visibility_mask, vis_mask)
+            apply_mask_to_gaussian_grads(gaussians, stage_visibility_mask)
+
+        zero_out_old_camera_grads(gaussians, old_camera_count)
+
+        if stage2_start <= iteration <= stage2_iters:
+            gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            if iteration % opt.densification_interval == 0:
+                size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+            if iteration % opt.opacity_reset_interval == 0:
+                gaussians.reset_opacity()
+
+        gaussians.optimizer.step()
+        gaussians.optimizer.zero_grad(set_to_none=True)
+
+        ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+        progress_bar.set_postfix({'Loss': f'{ema_loss_for_log:.7f}'})
+
+    progress_bar.close()
+
+    metrics_dir = os.path.join(scene.model_path, 'incremental_metrics')
+    evaluate_and_save(scene, gaussians, pipe, background, metrics_dir, train_cameras)
+
+    torch.save((gaussians.capture(), total_iters), os.path.join(scene.model_path, 'chkpnt_incremental.pth'))
+    scene.save('incremental')
+
+    if args.save_diff:
+        diff_mask = compute_diff_mask(gaussians, baseline_state, original_point_count, eps=args.diff_eps)
+        gaussians.save_ply_subset(args.save_diff, diff_mask)
+
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -295,7 +650,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -304,27 +658,46 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument('--test_iterations', nargs='+', type=int, default=[])
+    parser.add_argument('--save_iterations', nargs='+', type=int, default=[])
+    parser.add_argument('--quiet', action='store_true')
     parser.add_argument('--disable_viewer', action='store_true', default=True)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument('--checkpoint_iterations', nargs='+', type=int, default=[])
+    parser.add_argument('--start_checkpoint', type=str, default=None)
+    parser.add_argument('--load_ckpt', type=str, default=None)
+    parser.add_argument('--new_image', type=str, default=None)
+    parser.add_argument('--new_K', type=str, default=None)
+    parser.add_argument('--new_Tcw', type=str, default=None)
+    parser.add_argument('--est_pose', action='store_true')
+    parser.add_argument('--mast3r_ckpt', type=str, default='./mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth')
+    parser.add_argument('--est_device', type=str, default='cuda')
+    parser.add_argument('--est_image_size', type=int, default=512)
+    parser.add_argument('--est_max_refs', type=int, default=4)
+    parser.add_argument('--incremental_iters', type=int, default=1500)
+    parser.add_argument('--stage1_iters', type=int, default=400)
+    parser.add_argument('--stage2_iters', type=int, default=800)
+    parser.add_argument('--save_diff', type=str, default=None)
+    parser.add_argument('--diff_eps', type=float, default=1e-5)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--focal_avg', action='store_true')
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
+    incremental_mode = args.new_image is not None or args.est_pose
+    if not incremental_mode:
+        args.save_iterations.append(args.iterations)
 
     os.makedirs(args.model_path, exist_ok=True)
-    
+
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
-    # All done
+    if incremental_mode:
+        incremental_training(lp.extract(args), op.extract(args), pp.extract(args), args)
+    else:
+        training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+
     print("\nTraining complete.")
